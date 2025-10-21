@@ -1,0 +1,11 @@
+[package]
+name = "splitter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.43", features = ["derive"] }
+crossbeam = "0.8.4"
+crossbeam-channel = "0.5.15"
+duration-str = "0.17.0"
+tempfile = "3.23.0"
