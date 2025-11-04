@@ -1,6 +1,6 @@
 use std::io::{BufWriter, Write};
 use std::path::{self, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 use std::{env, io, thread};
 
@@ -10,33 +10,58 @@ use duration_str::parse;
 use tempfile::NamedTempFile;
 
 #[derive(Parser, Debug)]
+#[command(name = "splitter")]
+#[command(about = "A tool to split input into files based on line count or timeout")]
 struct Args {
-    #[arg(short = 't', long, value_parser = |arg: &str| parse(arg))]
+    #[arg(short = 't', long, value_parser = |arg: &str| parse(arg), help = "How long to wait for new input before creating a new file, e.g., 5s, 1m. If the timeout is reached, even if the number of lines is not reached, the file will be created.")]
     interval: Option<Duration>,
 
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, help = "Maximum number of lines per file")]
     lines: Option<usize>,
 
-    #[arg(short = 'x', long)]
+    #[arg(
+        short = 'x',
+        long,
+        help = "Command to execute after each file is created, the current file path is available in the FILE environment variable"
+    )]
     command: Option<String>,
 
-    #[arg(short = 'p', long, default_value = "x")]
-    prefix: String,
+    #[arg(short = 'p', long, help = "The prefix for the file name")]
+    prefix: Option<String>,
 
-    #[arg(short = 'F', long, default_value = "%Y%m%d%s%6f")]
+    #[arg(short = 's', long, help = "The suffix for the file name")]
+    suffix: Option<String>,
+
+    #[arg(
+        short = 'F',
+        long,
+        default_value = "%Y%m%d%s%6f",
+        help = "The format for the timestamp in the file name"
+    )]
     format: String,
 
-    #[arg(short = 'o', long)]
+    #[arg(
+        short = 'o',
+        long,
+        help = "Output directory, defaults to current directory"
+    )]
     output: Option<PathBuf>,
 }
 
 fn main() {
     let args = Args::parse();
 
-    if let Some(output_dir) = &args.output {
-        if !output_dir.exists() {
-            std::fs::create_dir_all(&output_dir).unwrap();
-        }
+    let output_dir = path::absolute(
+        args.output
+            .unwrap_or_else(|| env::current_dir().unwrap_or(".".into())),
+    )
+    .unwrap();
+
+    let prefix = args.prefix.unwrap_or_else(|| "".to_string());
+    let suffix = args.suffix.unwrap_or_else(|| "".to_string());
+
+    if !output_dir.exists() {
+        std::fs::create_dir_all(&output_dir).unwrap();
     }
 
     let (s, r) = unbounded();
@@ -49,23 +74,27 @@ fn main() {
 
     let max_lines = args.lines.unwrap_or(usize::MAX);
 
-    let mut file_lines = if let Some(lines) = args.lines {
-        Vec::with_capacity(lines)
-    } else {
-        Vec::new()
-    };
-
     loop {
+        let file = NamedTempFile::new().unwrap();
+
+        let mut writer = BufWriter::new(file.as_file());
+
+        let mut lines = 0;
+
         let timeout = args
             .interval
             .map(|duration| after(duration))
             .unwrap_or(never());
 
-        while max_lines > file_lines.len() {
+        while lines < max_lines {
             select! {
                 recv(r) -> msg => match msg {
                     Ok(value) => {
-                        file_lines.push(value);
+                        println!("Received: {}", value);
+
+                        writeln!(writer, "{}", value).unwrap();
+
+                        lines += 1;
                     }
                     Err(_) => continue,
                 },
@@ -76,46 +105,35 @@ fn main() {
             }
         }
 
+        // In case of no lines, we skip the file creation
+        if lines == 0 {
+            continue;
+        }
+
+        writer.flush().unwrap();
+
         let timestamp = chrono::Utc::now().format(&args.format).to_string();
 
-        let filename = format!("{}_{}", args.prefix, timestamp);
+        let file_name = format!("{}{}{}", prefix, timestamp, suffix);
+
+        let file_path = output_dir.join(file_name);
+
+        std::fs::rename(file.path(), &file_path).unwrap();
 
         if let Some(command) = &args.command {
             unsafe {
-                env::set_var("FILE", &filename);
+                env::set_var("FILE", &file_path);
             }
 
             let mut child =
                 Command::new(env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
                     .arg("-c")
                     .arg(command)
-                    .env("FILE", &filename)
-                    .stdin(Stdio::piped())
+                    .env("FILE", &file_path)
                     .spawn()
                     .unwrap();
 
-            if let Some(stdin) = child.stdin.as_mut() {
-                for line in file_lines.iter() {
-                    writeln!(stdin, "{}", line).unwrap();
-                }
-            }
-            let _ = child.wait();
-        } else if let Some(output_dir) = &args.output {
-            let file = NamedTempFile::new().unwrap();
-
-            let mut writer = BufWriter::new(file.as_file());
-
-            for line in &file_lines {
-                writeln!(writer, "{}", line).unwrap();
-            }
-
-            writer.flush().unwrap();
-
-            let filename = path::absolute(output_dir.as_path()).unwrap().join(filename);
-
-            std::fs::rename(file.path(), &filename).unwrap();
+            child.wait().unwrap();
         }
-
-        file_lines.clear();
     }
 }
