@@ -1,11 +1,13 @@
 use std::io::{BufWriter, Write};
 use std::path::{self, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{env, io, thread};
 
+use anyhow::{Context, Result};
 use clap::Parser;
-use crossbeam_channel::{after, never, select, unbounded};
+use crossbeam_channel::{after, bounded, never, select, unbounded};
 use duration_str::parse;
 use tempfile::NamedTempFile;
 
@@ -46,9 +48,31 @@ struct Args {
         help = "Output directory, defaults to current directory"
     )]
     output: Option<PathBuf>,
+
+    #[arg(
+        short = 'b',
+        long,
+        help = "Maximum number of lines to buffer in memory (unbounded if not set)"
+    )]
+    buffer_size: Option<usize>,
+
+    #[arg(
+        short = 'j',
+        long,
+        default_value = "1",
+        help = "Number of parallel workers for command execution"
+    )]
+    jobs: usize,
+
+    #[arg(
+        short = 'w',
+        long,
+        help = "Wait for each command to complete before processing next file"
+    )]
+    wait: bool,
 }
 
-fn main() {
+fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
@@ -57,22 +81,35 @@ fn main() {
         args.output
             .unwrap_or_else(|| env::current_dir().unwrap_or(".".into())),
     )
-    .unwrap();
+    .context("Failed to resolve output directory")?;
 
-    let prefix = args.prefix.unwrap_or_else(|| "".to_string());
-    let suffix = args.suffix.unwrap_or_else(|| "".to_string());
+    let prefix = args.prefix.unwrap_or_default();
+    let suffix = args.suffix.unwrap_or_default();
 
     if !output_dir.exists() {
         log::debug!("Creating output directory: {}", output_dir.display());
 
-        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&output_dir).context("Failed to create output directory")?;
     }
 
-    let (s, r) = unbounded();
+    let (s, r) = match args.buffer_size {
+        Some(size) => bounded(size),
+        None => unbounded(),
+    };
 
     thread::spawn(move || {
         for line in io::stdin().lines() {
-            s.send(line.unwrap()).unwrap();
+            match line {
+                Ok(line) => {
+                    if s.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to read from stdin: {}", e);
+                    break;
+                }
+            }
         }
     });
 
@@ -85,10 +122,63 @@ fn main() {
         args.interval
     );
 
+    let command_sender = if let Some(ref cmd) = args.command {
+        if !args.wait {
+            let (cmd_tx, cmd_rx) = bounded::<PathBuf>(args.jobs);
+            let cmd = Arc::new(cmd.clone());
+
+            for worker_id in 0..args.jobs {
+                let cmd_rx = cmd_rx.clone();
+                let cmd = Arc::clone(&cmd);
+
+                thread::spawn(move || {
+                    while let Ok(file_path) = cmd_rx.recv() {
+                        log::debug!(
+                            "Worker {} executing command for: {}",
+                            worker_id,
+                            file_path.display()
+                        );
+
+                        let result = Command::new(
+                            env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
+                        )
+                        .arg("-c")
+                        .arg(cmd.as_str())
+                        .env("FILE", &file_path)
+                        .spawn();
+
+                        match result {
+                            Ok(mut child) => {
+                                if let Err(e) = child.wait() {
+                                    log::error!("Failed to wait for command: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to spawn command '{}': {}", cmd, e);
+                            }
+                        }
+                    }
+                });
+            }
+
+            Some(cmd_tx)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut eof = false;
 
     while !eof {
-        let file = NamedTempFile::new().unwrap();
+        let file = match NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("Failed to create temp file: {}", e);
+                continue;
+            }
+        };
 
         let mut writer = BufWriter::new(file.as_file());
 
@@ -105,7 +195,10 @@ fn main() {
                     Ok(value) => {
                         log::debug!("Received: {}", value);
 
-                        writeln!(writer, "{}", value).unwrap();
+                        if let Err(e) = writeln!(writer, "{}", value) {
+                            log::error!("Failed to write to temp file: {}", e);
+                            break;
+                        }
 
                         lines += 1;
                     }
@@ -118,19 +211,21 @@ fn main() {
                 },
                 recv(timeout) -> _ => {
                     log::debug!("Timeout reached after {} lines", lines);
-
                     break;
                 },
             }
         }
 
-        // In case of no lines, we skip the file creation
+        // Skip file creation if no lines were written
         if lines == 0 {
             log::debug!("No lines received, skipping file creation");
             continue;
         }
 
-        writer.flush().unwrap();
+        if let Err(e) = writer.flush() {
+            log::error!("Failed to flush writer: {}", e);
+            continue;
+        }
 
         let timestamp = chrono::Utc::now().format(&args.format).to_string();
 
@@ -138,22 +233,47 @@ fn main() {
 
         let file_path = output_dir.join(file_name);
 
-        std::fs::rename(file.path(), &file_path).unwrap();
+        if file_path.exists() {
+            log::warn!("File already exists, skipping: {}", file_path.display());
+            continue;
+        }
+
+        if let Err(e) = std::fs::rename(file.path(), &file_path) {
+            log::error!(
+                "Failed to rename temp file to {}: {}",
+                file_path.display(),
+                e
+            );
+            continue;
+        }
 
         log::debug!("Created file: {} ({} lines)", file_path.display(), lines);
 
-        if let Some(command) = &args.command {
+        if let Some(ref sender) = command_sender {
+            if let Err(e) = sender.send(file_path) {
+                log::error!("Failed to send to worker pool: {}", e);
+            }
+        } else if let Some(command) = &args.command {
             log::debug!("Executing command: {}", command);
 
-            let mut child =
-                Command::new(env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
-                    .arg("-c")
-                    .arg(command)
-                    .env("FILE", &file_path)
-                    .spawn()
-                    .unwrap();
+            let result = Command::new(env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
+                .arg("-c")
+                .arg(command)
+                .env("FILE", &file_path)
+                .spawn();
 
-            child.wait().unwrap();
+            match result {
+                Ok(mut child) => {
+                    if let Err(e) = child.wait() {
+                        log::error!("Failed to wait for command: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to spawn command '{}': {}", command, e);
+                }
+            }
         }
     }
+
+    Ok(())
 }
