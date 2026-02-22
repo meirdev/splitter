@@ -49,6 +49,8 @@ struct Args {
 }
 
 fn main() {
+    env_logger::init();
+
     let args = Args::parse();
 
     let output_dir = path::absolute(
@@ -61,6 +63,8 @@ fn main() {
     let suffix = args.suffix.unwrap_or_else(|| "".to_string());
 
     if !output_dir.exists() {
+        log::debug!("Creating output directory: {}", output_dir.display());
+
         std::fs::create_dir_all(&output_dir).unwrap();
     }
 
@@ -74,7 +78,16 @@ fn main() {
 
     let max_lines = args.lines.unwrap_or(usize::MAX);
 
-    loop {
+    log::debug!(
+        "Starting splitter: output_dir={}, max_lines={}, interval={:?}",
+        output_dir.display(),
+        max_lines,
+        args.interval
+    );
+
+    let mut eof = false;
+
+    while !eof {
         let file = NamedTempFile::new().unwrap();
 
         let mut writer = BufWriter::new(file.as_file());
@@ -90,16 +103,22 @@ fn main() {
             select! {
                 recv(r) -> msg => match msg {
                     Ok(value) => {
-                        println!("Received: {}", value);
+                        log::debug!("Received: {}", value);
 
                         writeln!(writer, "{}", value).unwrap();
 
                         lines += 1;
                     }
-                    Err(_) => continue,
+                    Err(_) => {
+                        log::debug!("Channel closed (EOF)");
+
+                        eof = true;
+                        break;
+                    }
                 },
                 recv(timeout) -> _ => {
-                    eprintln!("timeout");
+                    log::debug!("Timeout reached after {} lines", lines);
+
                     break;
                 },
             }
@@ -107,6 +126,7 @@ fn main() {
 
         // In case of no lines, we skip the file creation
         if lines == 0 {
+            log::debug!("No lines received, skipping file creation");
             continue;
         }
 
@@ -120,10 +140,10 @@ fn main() {
 
         std::fs::rename(file.path(), &file_path).unwrap();
 
+        log::debug!("Created file: {} ({} lines)", file_path.display(), lines);
+
         if let Some(command) = &args.command {
-            unsafe {
-                env::set_var("FILE", &file_path);
-            }
+            log::debug!("Executing command: {}", command);
 
             let mut child =
                 Command::new(env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()))
