@@ -142,12 +142,12 @@ impl Splitter {
                 continue;
             }
 
-            if let Err(e) = writer.flush() {
+            if let Err(e) = writer.into_inner() {
                 log::error!("Failed to flush writer: {}", e);
                 continue;
             }
 
-            let file_path = match self.create_output_file(&file) {
+            let file_path = match self.create_output_file(file) {
                 Some(path) => path,
                 None => continue,
             };
@@ -160,7 +160,7 @@ impl Splitter {
         Ok(())
     }
 
-    fn create_output_file(&self, temp_file: &NamedTempFile) -> Option<PathBuf> {
+    fn create_output_file(&self, temp_file: NamedTempFile) -> Option<PathBuf> {
         let timestamp = chrono::Utc::now().format(&self.format).to_string();
         let file_name = format!("{}{}{}", self.prefix, timestamp, self.suffix);
         let file_path = self.output_dir.join(file_name);
@@ -170,9 +170,9 @@ impl Splitter {
             return None;
         }
 
-        if let Err(e) = std::fs::rename(temp_file.path(), &file_path) {
+        if let Err(e) = temp_file.persist(&file_path) {
             log::error!(
-                "Failed to rename temp file to {}: {}",
+                "Failed to persist temp file to {}: {}",
                 file_path.display(),
                 e
             );
